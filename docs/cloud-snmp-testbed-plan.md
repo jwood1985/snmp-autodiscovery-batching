@@ -104,7 +104,7 @@ Two target tiers:
 - Simulator: 1 small VM covers thousands of devices — the cheap path for scale.
 - ActiveGate: 1 VM. Prefer a **dedicated EEC performance profile** to raise scan throughput.
 
-## Open decisions (need input before provisioning)
+## Open decisions (RESOLVED — see "Decisions (locked)" below)
 1. **Cloud:** AWS or Azure? (Existing cloud footprint is Azure — `*.cloudapp.net` AGs.)
 2. **NVA mix:** Catalyst 8000V only, or add FortiGate/Arista for sysObjectID variety?
 3. **Self-managed NVAs vs. Equinix/Megaport NaaS?**
@@ -116,3 +116,30 @@ Two target tiers:
 This session can build the **Dynatrace-side** automation (autodiscovery config generation, batching,
 `.252` enumeration, dtctl apply, validation queries) against whatever targets exist. It **cannot**
 provision AWS/Azure VNets/NVAs/VMs (no cloud credentials here) — that step is yours or a cloud pipeline's.
+
+---
+
+## Decisions (locked) & provisioning
+
+- **Cloud:** Azure (matches existing `*.cloudapp.net` footprint).
+- **NVAs:** Cisco Catalyst 8000V + Fortinet FortiGate-VM (self-managed Marketplace VMs).
+- **Scale:** ~10,000 simulated devices via **snmpsim on one VM** that owns a routed `/18`
+  (`ip route add local <cidr> dev lo` + NIC IP-forwarding + UDR). No per-IP Azure config.
+- **Provisioner:** the user (this cloud session cannot reach `management.azure.com`).
+
+**Automation:** `provisioning/azure-snmp-testbed.sh` — idempotent, `APPLY=1`-gated az-CLI build of
+RG, VNet/subnet, NSG (SSH locked to your IP; intra-VNet UDP 161 via default rule), the ActiveGate VM,
+the snmpsim VM (+ UDR + IP forwarding + cloud-init), and the two NVAs (Marketplace terms + create).
+Run it where `az login` works; `APPLY=1 ./azure-snmp-testbed.sh teardown` removes everything.
+NVA Marketplace URNs version frequently — discover and set `CISCO_URN` / `FORTI_URN` (commands in the script).
+
+## Cost (approx, East US PAYG; deallocate when idle)
+| Component | Running | Idle (deallocated) |
+|---|---|---|
+| Simulator VM (D8s_v5, ~10k devices) | ~$0.38/hr (~$280/mo) | ~$5/mo (disk) |
+| ActiveGate VM (D2s_v5) | ~$0.10/hr (~$70/mo) | ~$3/mo |
+| NVAs ×2 (Catalyst 8000V + FortiGate-VM) | **PAYG software + VM: ~low-hundreds $/mo** (BYOL = VM only) | ~$5/mo each |
+| Private IPs / intra-VNet traffic | $0 | $0 |
+
+**Per short test window (all deallocated between runs): single-digit dollars.** The NVAs dominate cost;
+the 10k-device simulator is effectively one cheap VM.
