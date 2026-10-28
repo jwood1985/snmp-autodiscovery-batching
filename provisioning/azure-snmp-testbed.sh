@@ -27,7 +27,7 @@ AG_SIZE="${AG_SIZE:-Standard_D2s_v5}"
 SIM_SIZE="${SIM_SIZE:-Standard_D8s_v5}"      # headroom for scan bursts across 7 concurrent configs
 NVA_SIZE="${NVA_SIZE:-Standard_D4s_v5}"
 IMG_UBUNTU="${IMG_UBUNTU:-Ubuntu2204}"
-# NVA marketplace URNs change often + differ BYOL/PAYG. Discover then set these:
+# NVA marketplace URNs change often. Catalyst 8000V is BYOL (unlicensed/eval still serves SNMP -> VM-cost only). Discover then set:
 #   az vm image list --publisher cisco    --all -o table | grep -i c8000v
 #   az vm image list --publisher fortinet --all -o table | grep -i fortigate
 CISCO_URN="${CISCO_URN:-}"      # e.g. cisco:cisco-c8000v:17_15_01a-byol:latest

@@ -138,8 +138,19 @@ NVA Marketplace URNs version frequently — discover and set `CISCO_URN` / `FORT
 |---|---|---|
 | Simulator VM (D8s_v5, ~10k devices) | ~$0.38/hr (~$280/mo) | ~$5/mo (disk) |
 | ActiveGate VM (D2s_v5) | ~$0.10/hr (~$70/mo) | ~$3/mo |
-| NVAs ×2 (Catalyst 8000V + FortiGate-VM) | **PAYG software + VM: ~low-hundreds $/mo** (BYOL = VM only) | ~$5/mo each |
+| NVAs ×2 (Catalyst 8000V + FortiGate-VM), **BYOL** | **VM-only: ~$0.19/hr each (~$140/mo)** — no vendor hourly fee | ~$5/mo each |
 | Private IPs / intra-VNet traffic | $0 | $0 |
 
 **Per short test window (all deallocated between runs): single-digit dollars.** The NVAs dominate cost;
 the 10k-device simulator is effectively one cheap VM.
+
+## NVA licensing (BYOL)
+The Azure Marketplace Catalyst 8000V images are **BYOL** — no Cisco hourly software fee; you bring a
+license or run **unlicensed/eval**. For this test bed that's fine: Cisco licensing throttles **data-plane
+throughput/features, not the SNMP management plane**, so an unlicensed/eval C8000V still answers
+GETs (sysDescr/sysObjectID/ifTable) — exactly what discovery needs. Net effect: NVA cost ≈ VM compute only.
+
+**Zero-license alternative for fidelity:** load real vendor **`.snmprec` recordings** (a Cisco walk, a
+FortiGate walk) into snmpsim and map them to specific IPs. Autodiscovery keys on `sysObjectID`, so a
+recording classifies identically (correct `recommended.extension`). Real NVAs are only needed to later
+exercise the live vendor *monitoring* extensions against dynamic tables.
