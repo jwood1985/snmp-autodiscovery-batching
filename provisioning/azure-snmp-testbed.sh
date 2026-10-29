@@ -96,6 +96,10 @@ write_files:
       After=network-online.target snmpsim-localroute.service
       Wants=snmpsim-localroute.service
       [Service]
+      # snmpsim-lextudio confdir.py reads os.environ["HOME"] at import; systemd
+      # does not set HOME for services, so without this the responder crashes
+      # with KeyError: 'HOME' before it binds UDP 161.
+      Environment=HOME=/root
       ExecStart=/opt/snmpsim/venv/bin/snmpsim-command-responder --data-dir=/opt/snmpsim/data --agent-udpv4-endpoint=0.0.0.0:161
       Restart=always
       [Install]
