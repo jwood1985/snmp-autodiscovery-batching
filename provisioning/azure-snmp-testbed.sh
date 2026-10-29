@@ -34,7 +34,11 @@ CISCO_URN="${CISCO_URN:-}"      # e.g. cisco:cisco-c8000v:17_15_01a-byol:latest
 FORTI_URN="${FORTI_URN:-}"      # e.g. fortinet:fortinet_fortigate-vm_v5:fortinet_fg-vm:latest
 # --------------------------------------------------
 
-run(){ echo "+ $*"; [ "${APPLY:-0}" = "1" ] && "$@"; }
+# Print the command; run it only when APPLY=1. Uses `if` (not `&&`) so that in
+# dry-run mode run() returns 0 — otherwise the trailing false test trips `set -e`
+# and the script exits after the first command. In APPLY mode the real command's
+# exit status propagates, so `set -e` still catches genuine failures.
+run(){ echo "+ $*"; if [ "${APPLY:-0}" = "1" ]; then "$@"; fi; }
 
 teardown(){ echo ">>> deleting resource group $RG"; run az group delete -n "$RG" --yes --no-wait; exit 0; }
 [ "${1:-}" = "teardown" ] && teardown
