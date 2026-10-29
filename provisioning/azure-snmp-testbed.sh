@@ -96,10 +96,19 @@ write_files:
       After=network-online.target snmpsim-localroute.service
       Wants=snmpsim-localroute.service
       [Service]
-      # snmpsim-lextudio confdir.py reads os.environ["HOME"] at import; systemd
-      # does not set HOME for services, so without this the responder crashes
-      # with KeyError: 'HOME' before it binds UDP 161.
-      Environment=HOME=/root
+      # Run as a non-root user (snmpsim owns /opt/snmpsim). Two reasons:
+      #  - snmpsim-lextudio refuses to run as root unless handed --process-user
+      #    to drop to ("Must drop privileges to a non-privileged user&group");
+      #    running non-root from the start sidesteps that and the post-drop
+      #    file-permission issues.
+      #  - its confdir.py reads os.environ["HOME"] at import, which systemd does
+      #    not set for services (KeyError: 'HOME'); HOME below, owned by snmpsim,
+      #    satisfies both the import read and any runtime index writes.
+      # CAP_NET_BIND_SERVICE lets the non-root process still bind UDP 161.
+      User=snmpsim
+      Group=snmpsim
+      AmbientCapabilities=CAP_NET_BIND_SERVICE
+      Environment=HOME=/opt/snmpsim
       ExecStart=/opt/snmpsim/venv/bin/snmpsim-command-responder --data-dir=/opt/snmpsim/data --agent-udpv4-endpoint=0.0.0.0:161
       Restart=always
       [Install]
@@ -109,6 +118,9 @@ runcmd:
   - sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf; echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
   - python3 -m venv /opt/snmpsim/venv
   - /opt/snmpsim/venv/bin/pip install --upgrade pip snmpsim-lextudio
+  - groupadd --system snmpsim
+  - useradd --system --no-create-home --home-dir /opt/snmpsim --shell /usr/sbin/nologin -g snmpsim snmpsim
+  - chown -R snmpsim:snmpsim /opt/snmpsim
   - systemctl daemon-reload
   - systemctl enable --now snmpsim-localroute.service
   - systemctl enable --now snmpsim.service
