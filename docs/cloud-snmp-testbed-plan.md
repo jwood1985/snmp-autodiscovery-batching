@@ -70,6 +70,10 @@ Two target tiers:
 - Address them to match the batching test (e.g. a block of `10.<b>.<c>.252`).
 
 ### E. Dynatrace autodiscovery configs
+> ⚠️ **Superseded by field results — see "Measured Results & Corrections" at the end.**
+> On current ActiveGates (Python 3.14 runtime) use **extension 4.3.4** with a **platform token**
+> (`dt0s…`, scopes `storage:buckets:read` + `storage:smartscape:read`) and `scanner.profile`.
+> The 2.4.7 / `entities.read` / `threads` guidance below applies only to older AGs and is kept for history.
 - **Extension version: 2.4.7** (the 3.0.0 `utils.py:177 getOid()` bug crashes on any responding device;
   see `docs/dynatrace-snmp-auto-discovery-3.0.0-bug.md`). Scanner uses `threads` (not `profile`).
 - **De-dup token:** API token with `entities.read`, set in each config's `scanner.token`.
@@ -154,3 +158,72 @@ GETs (sysDescr/sysObjectID/ifTable) — exactly what discovery needs. Net effect
 FortiGate walk) into snmpsim and map them to specific IPs. Autodiscovery keys on `sysObjectID`, so a
 recording classifies identically (correct `recommended.extension`). Real NVAs are only needed to later
 exercise the live vendor *monitoring* extensions against dynamic tables.
+
+---
+
+## Measured Results & Corrections (qof78400, Azure, Nov 2026)
+
+Built and measured end to end on the live test bed. **Where this section conflicts with the plan above,
+this section wins** — it reflects what actually worked on a current ActiveGate.
+
+### As-built environment
+- **ActiveGate** `vm-ag.internal.cloudapp.net`, group `cloud-snmp`, Linux **x86-64**, AG **1.349**,
+  EEC performance profile **HIGH**. Resized **D2s_v5 (2 vCPU) → D8s_v5 (8 vCPU)** mid-campaign.
+- **Simulator** `vm-snmpsim`, **snmpsim-lextudio**, owns routed **`10.20.64.0/18`** (local route on `lo`
+  + NIC IP-forwarding + UDR); community `public-wood`. ~16k addressable; 10k used per test config.
+- **Unrouted** `10.20.128.0/18` (in-VNet, no subnet/route) used as the timeout (non-responder) target.
+
+### Corrections to the plan (these cost real debugging time)
+1. **Extension must be 4.3.4, not 2.4.7, on current AGs.** AG 1.349 ships a **Python 3.14** datasource
+   runtime. 2.4.7 bundles `dt-extensions-sdk 1.2.14` pinned to **Python <3.11** → venv build fails,
+   config stuck `ERROR` (`requires a different Python: 3.14.10 not in '<3.11,>=3.10'`). 3.0.0 builds but
+   still has the `getOid` crash. **4.3.4** (`dt-extensions-sdk 1.11.2`, `pysnmp 7.x`) builds on 3.14 **and**
+   has the `getOid` fix.
+2. **Install from the Hub via API when the UI balks.** The Hub UI on this INTERNAL tenant would not
+   upgrade past 2.4.7. Install worked via:
+   `dtctl create extension --hub-extension com.dynatrace.extension.snmp-auto-discovery --version 4.3.4`.
+3. **Token: platform token, not classic.** 4.x on **SaaS** requires a **platform token** (`dt0s…`) with
+   **`storage:buckets:read` + `storage:smartscape:read`** in `scanner.token`. A classic `dt0c01`
+   `entities.read` token → HTTP 401, fastcheck `WARNING`, and the scan **never promotes** past fastcheck
+   (config shows `ERROR`/looping). This was the final gate before any scan ran.
+4. **Scanner uses `profile`** (`DEFAULT` / `HIGH` / `DEDICATED`), not `threads` (that was 2.4.x).
+5. **`frequency` must exceed `scan_duration`.** A `frequency: 5` (300 s) config whose scan takes 303 s
+   throws `run_in_thread … took 302.99s, longer than the interval of 300.0s` every cycle. Production
+   720-min cadence is nowhere near this; aggressive test cadences hit it.
+
+### Throughput (10,000 `/32` targets per config; measured `sfm.snmp_autodiscovery.scan_duration`)
+| AG size | `scanner.profile` | workload | devices_ok | **scan_duration** | per-IP | high-CPU event |
+|---|---|---|---|---|---|---|
+| D2s_v5 (2 vCPU) | DEFAULT | all-respond | 10,000 | ~200 s | 0.020 s | no |
+| D2s_v5 (2 vCPU) | DEFAULT | timeout | 0 | 303 s | 0.030 s | **fired** |
+| D8s_v5 (8 vCPU) | DEFAULT | timeout | 0 | 286 s | 0.029 s | none |
+| D8s_v5 (8 vCPU) | **DEDICATED** | timeout | 0 | **85.6 s** | **0.0086 s** | fired once (transient) |
+
+**Interpretation**
+- **Empty-space sweeps are I/O-bound (SNMP timeout waits), not CPU-bound.** 2→8 vCPU barely changed time
+  (303→286 s) but cleared CPU saturation. Cores buy *headroom*, not *speed*.
+- **Concurrency is the speed lever.** `DEDICATED` profile (safe only once 8 vCPU gave headroom) cut the
+  timeout scan **3.3×** to **85.6 s/10k ≈ 117 IP/s**. On 2 vCPU this would have worsened the CPU alert.
+- All-respond (live devices) is *faster* per-IP than timeout; a real /8 is timeout-dominated, so the
+  timeout rate governs sizing.
+
+### /8 sizing (best setting: 8-vCPU AG, `DEDICATED`, ~117 IP/s timeout-bound)
+| Target | addresses | 1-AG sweep | AGs @ 12 h cadence | AGs @ 24 h |
+|---|---|---|---|---|
+| **`.252` enumeration** (`10.*.*.252`) | 65,536 | **~9 min** | **1** | 1 |
+| **Full /8** (every address) | 16,777,216 | ~40 h | ~4 \* | ~2 \* |
+
+\* **Throughput only.** The **100 configs × 10k = 1,000,000 addresses per AG-group** limit means a full /8
+(16.7 M) needs **≥17 AG-groups'-worth of configs regardless of speed**. → **The `.252` enumeration is the
+recommended path:** 65,536 addresses = **7 configs in one group on one AG, ~9 min/sweep**, trivially within
+any cadence. (Contended home-lab math implied **50–65 AGs** for /8; the dedicated 8-vCPU + DEDICATED cloud
+AG is ~15× more capable per node, and `.252` collapses /8 to a single AG.)
+
+### Open follow-ups
+- **Topology entities:** `EXT_NETWORK_DEVICE` smartscape count stayed **0** despite `devices_ok = 10,000`
+  and 20,001 metric lines ingested. Autodiscovery *inventories* devices and emits metrics; materializing
+  `EXT_NETWORK_DEVICE` nodes likely needs the `snmp-generic-device` monitoring extension. Confirm for rollout.
+- **Sustained load:** `DEDICATED` tripped the high-CPU detector once (transient) even on 8 vCPU; size the AG
+  (or cap concurrency) for continuous multi-config operation.
+- **Not yet measured:** all-respond at `DEDICATED`/8 vCPU (only timeout was swept there); profile `HIGH`
+  as a middle point.
