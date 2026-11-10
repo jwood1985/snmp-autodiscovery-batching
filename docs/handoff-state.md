@@ -8,15 +8,83 @@ Repo: `jwood1985/snmp-autodiscovery-batching` · branch `claude/awesome-curie-mi
 
 ---
 
+## Session update — 2026-11-09 (az-capable self-hosted session)
+
+Picked this up in an `az`-capable session (logged in as `josh.wood@dynatrace.com`, correct
+sub). Probed before rebuilding — and the picture changed from the 2026-11-08 snapshot:
+
+- **`vm-snmpsim` was genuinely wedged (confirmed), but recovered non-destructively.**
+  Pre-fix instance view showed **VM-agent status `null`** and extensions
+  (`enablevmaccess`, `MDE.Linux`) stuck `Transitioning` while fabric power = `running` —
+  i.e. guest-side hang, exactly as diagnosed. **`az vm redeploy vm-snmpsim`** (fresh host,
+  cold boot, keeps disk/NIC/IP `.5`) brought the **VM-agent back to `Ready`**. No rebuild
+  was needed. The old action-run-command slot was stuck `Conflict: execution in progress`;
+  a managed run-command (`--run-command-name fixsim`) was used to bypass it.
+- **Sim still NOT serving SNMP.** End-to-end `snmpget` from `vm-ag` → `10.20.64.1/.5/.10`
+  still returns `Timeout: No Response` after redeploy + a services restart attempt. Root
+  cause not yet isolated (snmpsim-local vs. UDR path) — see below.
+- **HARD CONSTRAINT in this session: the `Microsoft.Network` RP is unreachable.** Every
+  `az network ...` call (route-table, NIC, subnet) hung/terminated across many retries,
+  while `Microsoft.Compute` calls (VM lifecycle, run-command on `vm-ag`, redeploy) worked.
+  So from here I **cannot read or fix the `rt-sim` UDR**, and late in the session even
+  compute reads began timing out. **→ finish this in Cloud Shell (full ARM reach).**
+- ⚠️ **Cleanup owed:** a managed run-command resource **`fixsim`** was left on `vm-snmpsim`
+  (CLI poll timed out; it likely executed). Delete it:
+  `az vm run-command delete -g rg-snmp-testbed --vm-name vm-snmpsim --run-command-name fixsim --yes`.
+
+### Finish in Cloud Shell — self-contained block
+```bash
+az account set --subscription 8ab59822-f4d2-4576-b34f-58a6d4cdac49
+RG=rg-snmp-testbed
+# 1. SIM-LOCAL vs PATH split: restart services + self-get on the sim itself
+az vm run-command invoke -g $RG -n vm-snmpsim --command-id RunShellScript --scripts '
+  systemctl daemon-reload
+  systemctl restart snmpsim-localroute.service snmpsim.service
+  sleep 3
+  echo "services:"; systemctl is-active snmpsim snmpsim-localroute
+  echo "listener:"; ss -lunp | grep ":161 " || echo NONE
+  echo "localroute:"; ip route show table local | grep 10.20.64.0/18 || echo NONE
+  echo "ip_fwd:"; cat /proc/sys/net/ipv4/ip_forward
+  echo "self-get:"; snmpget -v2c -c public-wood -t2 -r1 127.0.0.1 1.3.6.1.2.1.1.1.0 2>&1 | head -1
+  echo "snmpsim log:"; journalctl -u snmpsim --no-pager -n 10' \
+  --query "value[0].message" -o tsv
+#    If self-get returns the sysDescr but vm-ag still times out  -> PATH problem (step 2).
+#    If self-get also fails / snmpsim inactive               -> snmpsim problem (fix the unit/venv).
+# 2. PATH: verify the UDR next-hop actually points at the sim's CURRENT private IP
+SIM_IP=$(az vm list-ip-addresses -g $RG -n vm-snmpsim --query '[0].virtualMachine.network.privateIpAddresses[0]' -o tsv)
+echo "sim IP = $SIM_IP"
+az network route-table route show -g $RG --route-table-name rt-sim -n to-sim \
+  --query '{prefix:addressPrefix,type:nextHopType,nextHop:nextHopIpAddress}' -o json
+#    If nextHop != $SIM_IP, re-point it:
+# az network route-table route update -g $RG --route-table-name rt-sim -n to-sim --next-hop-ip-address $SIM_IP
+#    Also confirm the NIC still forwards: 
+# az network nic update -g $RG -n vm-snmpsimVMNic --ip-forwarding true
+# 3. VERIFY end-to-end from the AG, then clean up the leftover run-command
+az vm run-command invoke -g $RG -n vm-ag --command-id RunShellScript \
+  --scripts 'snmpget -v2c -c public-wood -t3 -r1 10.20.64.1 1.3.6.1.2.1.1.1.0' --query "value[0].message" -o tsv
+az vm run-command delete -g $RG --vm-name vm-snmpsim --run-command-name fixsim --yes
+```
+Once the sim answers, generic-device config **`d3ff9c1a`** self-heals on its next poll →
+check `EXT_NETWORK_DEVICE` smartscape count (expect 10). That's the topology proof.
+
+### Corrections to earlier facts (verified live 2026-11-09)
+- `vm-ag` is **`D4s_v5` (4 vCPU)**, not `D8s_v5` — the "Azure infrastructure" table below is
+  wrong. (The DEDICATED-profile throughput numbers were measured on 8 vCPU; current AG is 4.)
+- Region confirmed `centralus`; all four VMs show fabric power `running`.
+
+---
+
 ## TL;DR — what's done, what's blocked
 
 - ✅ Throughput campaign complete; results in `docs/cloud-snmp-testbed-plan.md`.
 - ✅ Topology question answered (by docs): **autodiscovery does NOT create Smartscape
   entities; the monitoring extension (`snmp-generic-device`) does.**
 - ⏳ **ONE thing blocked:** the live topology proof. The `snmp-generic-device` config is
-  deployed and armed but erroring `DEVICE_CONNECTION_ERROR` because **`vm-snmpsim` is
-  wedged** (guest OS unresponsive — SSH, `az vm run-command`, and reboot all time out).
-  **Next action = rebuild `vm-snmpsim` (needs `az`), then the config self-heals.**
+  deployed and armed but erroring `DEVICE_CONNECTION_ERROR` because **`vm-snmpsim` is not
+  serving SNMP.** _(Updated 2026-11-09: the VM was wedged but `az vm redeploy` recovered the
+  guest agent — no rebuild needed. It still doesn't answer SNMP; finish via the Cloud Shell
+  block in the "Session update — 2026-11-09" section above. The Network RP is unreachable
+  from the self-hosted session, so the UDR check must run in Cloud Shell.)_
 
 ---
 
@@ -32,8 +100,8 @@ Repo: `jwood1985/snmp-autodiscovery-batching` · branch `claude/awesome-curie-mi
 
 | VM | Size | Role | State |
 |---|---|---|---|
-| `vm-ag` | **D8s_v5 (8 vCPU)** | ActiveGate, group `cloud-snmp`, EEC profile HIGH, priv IP `10.20.0.4` | **ALIVE** (polling) |
-| `vm-snmpsim` | D8s_v5 | snmpsim, owns routed `10.20.64.0/18` (local route on `lo` + NIC IP-fwd + UDR) | **WEDGED — rebuild needed** |
+| `vm-ag` | **D4s_v5 (4 vCPU)** [corrected 2026-11-09] | ActiveGate, group `cloud-snmp`, EEC profile HIGH, priv IP `10.20.0.4` | **ALIVE** (polling) |
+| `vm-snmpsim` | D8s_v5 | snmpsim, owns routed `10.20.64.0/18` (local route on `lo` + NIC IP-fwd + UDR) | **redeployed 2026-11-09 — agent `Ready`, but not yet serving SNMP** |
 | `vm-c8000v` | D4s_v5 | Cisco Catalyst 8000V NVA (BYOL) | exists; **SNMP never configured on it** |
 | `vm-fgt` | D4s_v5 | FortiGate-VM NVA (BYOL) | exists; **SNMP never configured on it** |
 
