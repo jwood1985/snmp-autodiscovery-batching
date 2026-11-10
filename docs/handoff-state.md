@@ -8,6 +8,43 @@ Repo: `jwood1985/snmp-autodiscovery-batching` · branch `claude/awesome-curie-mi
 
 ---
 
+## Session update — 2026-11-10b (ROOT CAUSE CORRECTED — it was source-address, not GETBULK)
+
+**The "pysnmp/GETBULK incompatibility" below is WRONG — corrected here.** Packet capture on
+the sim (tcpdump) during a native fastcheck showed the true cause:
+
+- The AG sends `GetRequest` to `10.20.64.1`; snmpsim replies **from `10.20.0.5`** (its primary
+  IP), not from the queried `10.20.64.1`. The reply is an artifact of the local-route trick
+  (snmpsim binds `0.0.0.0`; kernel picks `.0.5` as source).
+- The EEC's **native `ds:snmp` datasource validates the response source address** and discards
+  the mismatched replies → reports `DEVICE_CONNECTION_ERROR` / "GetBulk timeout".
+- **net-snmp and pysnmp don't validate source**, so they accepted the replies — which is why
+  manual `snmpget`/`snmpbulkget` and a raw pysnmp GETBULK all "worked" and masked the real cause.
+  The real C8000V replies from its own real IP, so the AG accepts it.
+- Also: `snmp-generic-device` uses the **native `snmp` datasource** (`dataSources:["snmp"]`),
+  NOT python/pysnmp. (Autodiscovery is the pysnmp one — that's why it scanned 10k sim IPs fine.)
+
+**Fix (proven):** bind snmpsim to the **specific** destination IPs so replies source-match:
+`--agent-udpv4-endpoint=10.20.64.1:161 …` (set `net.ipv4.ip_nonlocal_bind=1`). After rebinding
+to `10.20.64.1-10` and pointing a config there, fastcheck went **OK** and a sim device
+materialized as `EXT_NETWORK_DEVICE` (`sim-device`). Count reached **2** (`sim-device` +
+`vm-c8000v`).
+
+**Scaling to 50k topological sim devices (now feasible — engineering, not a blocker):**
+1. **Source-match at scale:** bind 50k explicit endpoints (FD/mem tuning, split across snmpsim
+   procs) OR patch snmpsim to reply via `IP_PKTINFO` from the received dest (keeps wildcard bind).
+2. **Unique identity per device:** identical recordings **dedupe to one Smartscape entity**
+   (3 sim IPs → 1 `sim-device`). Need per-IP recordings / a variation module giving each a unique
+   `sysName`/`sysObjectID`.
+3. **Monitoring scale:** generic-device *monitors* (ifTable walks/cycle) — a multi-AG fleet,
+   device-per-config limits, and ~50k + interface entities vs tenant/licensing ceilings.
+
+**Left this session:** test config `983d744e` (sim, `ag_group-cloud-snmp`) still exists; snmpsim
+now binds only `10.20.64.1-10` (dropped the `0.0.0.0` wildcard, so other IPs in the /18 no longer
+answer — revert the unit's ExecStart to `--agent-udpv4-endpoint=0.0.0.0:161` to restore that).
+
+---
+
 ## Session update — 2026-11-10 (TOPOLOGY PROOF — RESOLVED)
 
 End-to-end topology proof landed. What it took, in order:
@@ -140,12 +177,13 @@ poll → check `EXT_NETWORK_DEVICE` smartscape count (expect 10). That's the top
   pointed at the **real Cisco C8000V** (`10.20.0.6`) → status **OK** → Smartscape shows
   **`EXT_NETWORK_DEVICE` = 1** (`vm-c8000v...cloudapp.net`) **+ `EXT_NETWORK_INTERFACE` = 3**.
   This confirms the monitoring extension (not autodiscovery) materializes the topology entities.
-  **Key blocker found along the way: snmpsim does NOT answer the extension's pysnmp-7.x
-  GETBULK** (GET works, net-snmp bulk works, but the EEC's GETBULK gets no response →
-  fastcheck stuck `DEVICE_CONNECTION_ERROR`). The extension only allows SNMPv2c/SNMPv3 (both
-  use GETBULK) and tuning `maxRepetitions`/`maxOidsPerQuery` doesn't help → **a real device
-  (or a simulator that speaks pysnmp GETBULK) is required for the topology proof.** See the
-  2026-11-10 resolution block below.
+  **Real root cause of the sim failing (CORRECTED — it was NOT GETBULK): source-address
+  mismatch.** snmpsim replies from its primary IP `10.20.0.5` (local-route artifact), not the
+  queried `10.20.64.x`; the AG's native `ds:snmp` validates response source and rejects it.
+  net-snmp/pysnmp are lenient so they masked it. **Fix: bind snmpsim to the specific dest IPs**
+  → proven: a sim device then materialized as `EXT_NETWORK_DEVICE`. **50k topological is now
+  feasible** (source-match at scale + unique per-device identity to avoid Smartscape dedup +
+  monitoring AG fleet). See the "2026-11-10b" block below.
 
 ---
 
