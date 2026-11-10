@@ -8,6 +8,46 @@ Repo: `jwood1985/snmp-autodiscovery-batching` · branch `claude/awesome-curie-mi
 
 ---
 
+## Session update — 2026-11-10 (TOPOLOGY PROOF — RESOLVED)
+
+End-to-end topology proof landed. What it took, in order:
+
+1. **Sim (`vm-snmpsim`) rebuilt** (delete+recreate from cloud-init) — now serves GET/GETNEXT/
+   GETBULK to net-snmp on `10.20.0.5` and the routed range `10.20.64.x`. Recording enriched
+   with `ifTable`+`ifXTable`.
+2. **But the generic-device config stayed `DEVICE_CONNECTION_ERROR` against the sim.** AG
+   datasource log (`…/datasources/com.dynatrace.extension.snmp-generic-device/
+   dynatracesourcesnmp_fastcheck*.log`) showed `GetBulk query timeout for OID 1.3.6.1.2.1.1.5.0`
+   every cycle. Diagnosis: **the EEC's pysnmp-7.x GETBULK is silently dropped by
+   snmpsim-lextudio** — snmpsim logs the extension's GETs (and answers them) but logs **zero
+   GETBULK**, while `snmpbulkget` (net-snmp) to the same IPs works. Community is fine
+   (`public-wood`; the `b'c2d6…'` in snmpsim logs is its internal hash). Tuning
+   `advanced.maxRepetitions=1`/`maxOidsPerQuery=1` did nothing; **SNMPv1 (no GETBULK) is
+   rejected — extension allows only SNMPv2c/SNMPv3.** → simulator path is a dead end for this
+   extension.
+3. **Switched to a real device.** `vm-c8000v` rebuilt in Cloud Shell (same NIC → kept
+   `10.20.0.6`; `--admin-password` provisioned SSH; **custom-data day-0 config was ignored**
+   by the image, so SNMP was NOT auto-configured). Configured it over SSH from `vm-ag`
+   (`sshpass` + `azureuser` / the admin password set during the Cloud Shell rebuild — **not
+   stored here; rotate or tear down the RG when done**): `snmp-server community public-wood RO` +
+   `write memory`. Verified: `sysDescr = Cisco IOS Software IOSXE 17.15.6`, `sysObjectID
+   1.3.6.1.4.1.9.1.3004`, **GETBULK works.**
+4. **Pointed config `d3ff9c1a` at `10.20.0.6`** (SNMPv2c/public-wood, via platform-token PUT) →
+   fastcheck `Status OK (0)` → status **OK** → **`EXT_NETWORK_DEVICE`=1, `EXT_NETWORK_INTERFACE`=3.**
+
+**Platform token:** a working one already exists in the workspace — `dt0s16.H6EEDTHA.…`
+(found in `/root/.bash_history` as `DT_APP_PLATFORM_TOKEN`). It authenticates the
+`/platform/extensions/v2/extensions/<ext>/monitoring-configurations[/<id>[/status]]` GET/PUT.
+(dtctl's own OAuth token 401s on that endpoint; dtctl `query`/`get` work for DQL/smartscape.)
+
+**Gotchas banked:** C8000V `az vm user update` hangs (guest agent `Not Ready`); its custom-data
+day-0 config is ignored (SSH comes from `--admin-password`, configure SNMP via SSH after boot);
+`az vm run-command` is unsupported on IOS-XE (use `vm-ag` as an intra-VNet SSH jump host);
+`az network …` (Network RP) was frequently unreachable from the self-hosted session — do
+NSG/route edits in Cloud Shell.
+
+---
+
 ## Session update — 2026-11-09 (az-capable self-hosted session)
 
 Picked this up in an `az`-capable session (logged in as `josh.wood@dynatrace.com`, correct
@@ -96,14 +136,16 @@ poll → check `EXT_NETWORK_DEVICE` smartscape count (expect 10). That's the top
 - ✅ Throughput campaign complete; results in `docs/cloud-snmp-testbed-plan.md`.
 - ✅ Topology question answered (by docs): **autodiscovery does NOT create Smartscape
   entities; the monitoring extension (`snmp-generic-device`) does.**
-- ⏳ **ONE thing blocked:** the live topology proof. The `snmp-generic-device` config is
-  deployed and armed but erroring `DEVICE_CONNECTION_ERROR` because **`vm-snmpsim` is not
-  serving SNMP.** _(Updated 2026-11-09: the VM was wedged but `az vm redeploy` recovered the
-  guest agent — no rebuild needed. Root cause now isolated: **snmpsim is not listening on
-  :161** (sim pings but its own primary IP `10.20.0.5` doesn't answer SNMP — the UDR path is
-  ruled out). Restarts didn't fix it → broken install/venv. Finish via the snmpsim-repair
-  Cloud Shell block in the "Session update — 2026-11-09" section; ARM egress was too degraded
-  this session to repair/verify the guest from here.)_
+- ✅ **TOPOLOGY PROOF ACHIEVED (2026-11-10).** `snmp-generic-device` config `d3ff9c1a`
+  pointed at the **real Cisco C8000V** (`10.20.0.6`) → status **OK** → Smartscape shows
+  **`EXT_NETWORK_DEVICE` = 1** (`vm-c8000v...cloudapp.net`) **+ `EXT_NETWORK_INTERFACE` = 3**.
+  This confirms the monitoring extension (not autodiscovery) materializes the topology entities.
+  **Key blocker found along the way: snmpsim does NOT answer the extension's pysnmp-7.x
+  GETBULK** (GET works, net-snmp bulk works, but the EEC's GETBULK gets no response →
+  fastcheck stuck `DEVICE_CONNECTION_ERROR`). The extension only allows SNMPv2c/SNMPv3 (both
+  use GETBULK) and tuning `maxRepetitions`/`maxOidsPerQuery` doesn't help → **a real device
+  (or a simulator that speaks pysnmp GETBULK) is required for the topology proof.** See the
+  2026-11-10 resolution block below.
 
 ---
 
