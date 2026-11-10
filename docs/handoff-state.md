@@ -20,52 +20,69 @@ sub). Probed before rebuilding — and the picture changed from the 2026-11-08 s
   cold boot, keeps disk/NIC/IP `.5`) brought the **VM-agent back to `Ready`**. No rebuild
   was needed. The old action-run-command slot was stuck `Conflict: execution in progress`;
   a managed run-command (`--run-command-name fixsim`) was used to bypass it.
-- **Sim still NOT serving SNMP.** End-to-end `snmpget` from `vm-ag` → `10.20.64.1/.5/.10`
-  still returns `Timeout: No Response` after redeploy + a services restart attempt. Root
-  cause not yet isolated (snmpsim-local vs. UDR path) — see below.
-- **HARD CONSTRAINT in this session: the `Microsoft.Network` RP is unreachable.** Every
-  `az network ...` call (route-table, NIC, subnet) hung/terminated across many retries,
-  while `Microsoft.Compute` calls (VM lifecycle, run-command on `vm-ag`, redeploy) worked.
-  So from here I **cannot read or fix the `rt-sim` UDR**, and late in the session even
-  compute reads began timing out. **→ finish this in Cloud Shell (full ARM reach).**
-- ⚠️ **Cleanup owed:** a managed run-command resource **`fixsim`** was left on `vm-snmpsim`
-  (CLI poll timed out; it likely executed). Delete it:
-  `az vm run-command delete -g rg-snmp-testbed --vm-name vm-snmpsim --run-command-name fixsim --yes`.
+- **Sim still NOT serving SNMP — root cause now ISOLATED: snmpsim is not listening on :161.**
+  Decisive discriminator run from `vm-ag` (reliable channel, bypasses the UDR entirely):
+  `ping 10.20.0.5` → **OK**, but `snmpget 10.20.0.5` (the sim's **own primary NIC IP**, normal
+  intra-subnet routing, no UDR/local-route involved) → **`Timeout: No Response`**. The host is
+  up; nothing answers on UDP 161. **The UDR/path is RULED OUT** — the earlier "snmpsim-local
+  vs. UDR" question is answered: it's snmpsim itself. Plain `systemctl restart` (attempted
+  several times via run-command) did **not** fix it → the install/venv or unit on the disk is
+  broken, not merely stopped. A blind venv-rebuild recovery was attempted but could not be
+  confirmed (see constraint below); post-attempt `vm-ag → 10.20.0.5` still timed out.
+- **HARD CONSTRAINT in this session: ARM egress is badly degraded.** Every `Microsoft.Network`
+  call (route-table, NIC, subnet) hung across many retries. Worse, the sim's **action**
+  run-command slot is stuck `Conflict: execution in progress` (survived the redeploy), and
+  **managed** run-command create/update/show calls time out or return empty — so I could not
+  reliably execute a guest fix **nor read `journalctl`** from here. Only `vm-ag`'s run-command
+  and a few compute reads worked, intermittently. **→ finish in Cloud Shell (clean ARM reach).**
+- ⚠️ **Cleanup owed:** leftover managed run-commands on `vm-snmpsim`: **`fixsim`** and
+  **`recover1`**. Delete both:
+  `for n in fixsim recover1; do az vm run-command delete -g rg-snmp-testbed --vm-name vm-snmpsim --run-command-name $n --yes; done`.
 
 ### Finish in Cloud Shell — self-contained block
+> Diagnosis is settled: **fix snmpsim on the sim; the UDR is NOT the problem.** Oracle for
+> "fixed" = `vm-ag → 10.20.0.5` returns the sysDescr (that path needs no UDR). Only if the sim's
+> **own** IP answers but the routed `10.20.64.x` range still times out does the UDR/local-route
+> matter — kept as the secondary check at the end.
 ```bash
 az account set --subscription 8ab59822-f4d2-4576-b34f-58a6d4cdac49
 RG=rg-snmp-testbed
-# 1. SIM-LOCAL vs PATH split: restart services + self-get on the sim itself
+# NOTE: the action run-command slot on vm-snmpsim may still be stuck 'Conflict'. If so, use a
+# managed run-command instead: az vm run-command create ... --run-command-name fix2 --async-execution false
+# 1. REPAIR snmpsim on the sim (rebuild venv only if the responder binary is broken) + show WHY
 az vm run-command invoke -g $RG -n vm-snmpsim --command-id RunShellScript --scripts '
+  systemctl stop snmpsim 2>/dev/null
+  if ! /opt/snmpsim/venv/bin/snmpsim-command-responder --help >/dev/null 2>&1; then
+    rm -rf /opt/snmpsim/venv; python3 -m venv /opt/snmpsim/venv
+    /opt/snmpsim/venv/bin/pip install --upgrade pip snmpsim-lextudio
+  fi
+  id snmpsim >/dev/null 2>&1 || { groupadd --system snmpsim; useradd --system --no-create-home \
+    --home-dir /opt/snmpsim --shell /usr/sbin/nologin -g snmpsim snmpsim; }
+  chown -R snmpsim:snmpsim /opt/snmpsim
+  sysctl -w net.ipv4.ip_forward=1
   systemctl daemon-reload
-  systemctl restart snmpsim-localroute.service snmpsim.service
-  sleep 3
-  echo "services:"; systemctl is-active snmpsim snmpsim-localroute
-  echo "listener:"; ss -lunp | grep ":161 " || echo NONE
-  echo "localroute:"; ip route show table local | grep 10.20.64.0/18 || echo NONE
-  echo "ip_fwd:"; cat /proc/sys/net/ipv4/ip_forward
-  echo "self-get:"; snmpget -v2c -c public-wood -t2 -r1 127.0.0.1 1.3.6.1.2.1.1.1.0 2>&1 | head -1
-  echo "snmpsim log:"; journalctl -u snmpsim --no-pager -n 10' \
+  systemctl enable --now snmpsim-localroute.service
+  systemctl restart snmpsim.service; sleep 3
+  echo "active:"; systemctl is-active snmpsim snmpsim-localroute
+  echo "listen:"; ss -lunp | grep ":161 " || echo NO-161
+  echo "self :"; snmpget -v2c -c public-wood -t2 -r1 127.0.0.1 1.3.6.1.2.1.1.1.0 2>&1 | head -1
+  echo "WHY (journal, read this if it still fails):"; journalctl -u snmpsim --no-pager -n 20' \
   --query "value[0].message" -o tsv
-#    If self-get returns the sysDescr but vm-ag still times out  -> PATH problem (step 2).
-#    If self-get also fails / snmpsim inactive               -> snmpsim problem (fix the unit/venv).
-# 2. PATH: verify the UDR next-hop actually points at the sim's CURRENT private IP
-SIM_IP=$(az vm list-ip-addresses -g $RG -n vm-snmpsim --query '[0].virtualMachine.network.privateIpAddresses[0]' -o tsv)
-echo "sim IP = $SIM_IP"
-az network route-table route show -g $RG --route-table-name rt-sim -n to-sim \
-  --query '{prefix:addressPrefix,type:nextHopType,nextHop:nextHopIpAddress}' -o json
-#    If nextHop != $SIM_IP, re-point it:
+# 2. VERIFY from the AG — sim OWN IP first (no UDR), then the routed range
+az vm run-command invoke -g $RG -n vm-ag --command-id RunShellScript --scripts '
+  echo -n "0.5  => "; snmpget -v2c -c public-wood -t3 -r1 10.20.0.5  1.3.6.1.2.1.1.1.0 2>&1 | head -1
+  echo -n "64.1 => "; snmpget -v2c -c public-wood -t3 -r1 10.20.64.1 1.3.6.1.2.1.1.1.0 2>&1 | head -1' \
+  --query "value[0].message" -o tsv
+# 3. ONLY IF 0.5 answers but 64.1 times out -> it IS the UDR/local-route path:
+# SIM_IP=$(az vm list-ip-addresses -g $RG -n vm-snmpsim --query '[0].virtualMachine.network.privateIpAddresses[0]' -o tsv)
+# az network route-table route show -g $RG --route-table-name rt-sim -n to-sim -o json   # nextHop == $SIM_IP ?
 # az network route-table route update -g $RG --route-table-name rt-sim -n to-sim --next-hop-ip-address $SIM_IP
-#    Also confirm the NIC still forwards: 
 # az network nic update -g $RG -n vm-snmpsimVMNic --ip-forwarding true
-# 3. VERIFY end-to-end from the AG, then clean up the leftover run-command
-az vm run-command invoke -g $RG -n vm-ag --command-id RunShellScript \
-  --scripts 'snmpget -v2c -c public-wood -t3 -r1 10.20.64.1 1.3.6.1.2.1.1.1.0' --query "value[0].message" -o tsv
-az vm run-command delete -g $RG --vm-name vm-snmpsim --run-command-name fixsim --yes
+# 4. cleanup leftover managed run-commands
+for n in fixsim recover1; do az vm run-command delete -g $RG --vm-name vm-snmpsim --run-command-name $n --yes 2>/dev/null; done
 ```
-Once the sim answers, generic-device config **`d3ff9c1a`** self-heals on its next poll →
-check `EXT_NETWORK_DEVICE` smartscape count (expect 10). That's the topology proof.
+Once `vm-ag → 10.20.64.1` answers, generic-device config **`d3ff9c1a`** self-heals on its next
+poll → check `EXT_NETWORK_DEVICE` smartscape count (expect 10). That's the topology proof.
 
 ### Corrections to earlier facts (verified live 2026-11-09)
 - `vm-ag` is **`D4s_v5` (4 vCPU)**, not `D8s_v5` — the "Azure infrastructure" table below is
@@ -82,9 +99,11 @@ check `EXT_NETWORK_DEVICE` smartscape count (expect 10). That's the topology pro
 - ⏳ **ONE thing blocked:** the live topology proof. The `snmp-generic-device` config is
   deployed and armed but erroring `DEVICE_CONNECTION_ERROR` because **`vm-snmpsim` is not
   serving SNMP.** _(Updated 2026-11-09: the VM was wedged but `az vm redeploy` recovered the
-  guest agent — no rebuild needed. It still doesn't answer SNMP; finish via the Cloud Shell
-  block in the "Session update — 2026-11-09" section above. The Network RP is unreachable
-  from the self-hosted session, so the UDR check must run in Cloud Shell.)_
+  guest agent — no rebuild needed. Root cause now isolated: **snmpsim is not listening on
+  :161** (sim pings but its own primary IP `10.20.0.5` doesn't answer SNMP — the UDR path is
+  ruled out). Restarts didn't fix it → broken install/venv. Finish via the snmpsim-repair
+  Cloud Shell block in the "Session update — 2026-11-09" section; ARM egress was too degraded
+  this session to repair/verify the guest from here.)_
 
 ---
 
