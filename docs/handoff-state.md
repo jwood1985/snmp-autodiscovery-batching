@@ -39,7 +39,16 @@ materialized as `EXT_NETWORK_DEVICE` (`sim-device`). Count reached **2** (`sim-d
 3. **Monitoring scale:** generic-device *monitors* (ifTable walks/cycle) — a multi-AG fleet,
    device-per-config limits, and ~50k + interface entities vs tenant/licensing ceilings.
 
-**Left this session:** test config `983d744e` (sim, `ag_group-cloud-snmp`) still exists; snmpsim
+**Mid-scale test + 50k sizing → see `docs/50k-topology-sizing.md`.** Built 50 **uniquely-identified**
+sim devices (per-device community→recording `w001..w050`, sysName `sim-dev-NNN`, full ifTable+ifXTable;
+snmpsim bound to `10.20.64.1-50`; config `b7fb4e87`). Findings: polling load negligible (AG loadavg
+~0.14 / 4 vCPU); recordings MUST include every featureSet OID (missing ifXTable → `INVALID_CONFIG_ERROR
+Text-type oid used as metric value`); **but entity materialization is the blocker — only ~1 of 50 unique
+devices registered as `EXT_NETWORK_DEVICE` over ~20 min** despite config OK. So 50k is gated by
+materialization throughput + tenant entity/licensing limits, NOT polling CPU. Resolve the
+registration/latency behavior at 50–100 scale before any 50k fan-out.
+
+**Left this session:** test configs `983d744e` + `b7fb4e87` (sim, `ag_group-cloud-snmp`) still exist; snmpsim
 now binds only `10.20.64.1-10` (dropped the `0.0.0.0` wildcard, so other IPs in the /18 no longer
 answer — revert the unit's ExecStart to `--agent-udpv4-endpoint=0.0.0.0:161` to restore that).
 
