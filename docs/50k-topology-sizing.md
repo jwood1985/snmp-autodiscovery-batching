@@ -29,12 +29,44 @@ and that — not CPU — is what must be solved before 50k.
 5. **Polling load is negligible at this scale.** 50 devices @ 1-min, `SNMP Health`+`Interfaces`:
    AG loadavg ~**0.14** on 4 vCPU. CPU/poll is NOT the 50k bottleneck.
 
-## ⚠️ Risk that blocks 50k today
-At 50 unique sim devices the config reported **OK / polling all 50**, yet only the real C8000V produced
-`device.name`-attributed metrics and a stable entity; the 50 sim devices did **not** fully register as
-entities/metrics within the test window (~15 min, through some churn). Until this entity-registration
-behavior for many unique SNMP devices is understood/resolved, 50k will not materialize regardless of
-infrastructure. **Resolve at 50–100 scale first.**
+## ⚠️ ROOT CAUSE of "only 1 of 50 materialises" — ENTITY IDENTITY COLLAPSE (diagnosed 2026-11-11)
+
+**Collection is NOT the problem.** The AG runtime status for the 50-device config reads
+`Endpoints OK: 50 WARNING: 0 ERROR: 0` — the extension successfully polls all 50.
+
+**All simulated devices upsert into ONE `EXT_NETWORK_DEVICE` entity.** `smartscapeNodes` holds exactly
+2 nodes (1 sim + the real C8000V), and the sim node's attributes **rotate** between devices on each poll:
+
+| observed at | name | snmp.ip | snmp.sys_object_id |
+|---|---|---|---|
+| 21:40 | `sim-dev-024` | – | – |
+| 02:47 | `sim-device` | 10.20.64.2 | .1.3.6.1.4.1.8072.3.2.10 |
+| 03:01 | `sim-dev-048` | 10.20.64.48 | – |
+| 03:23 | `sim-dev-005` | 10.20.64.5 | .1.3.6.1.4.1.8072.3.2.5 |
+
+One entity, one `interface_count: 2`, fields overwritten by whichever device polled last. Confirmed with
+the second (3-device) config **deleted**, so it is not an artifact of a shared recording.
+
+**The distinguishing attribute is hardware identity.** The sim node has `chassis_mac: "n/a"`,
+`mac: ["n/a"]`, `cdp.device_id: "n/a"`; the real Cisco has `chassis_mac: 00:0D:3A:97:49:68` and
+`cdp.device_id: vm-c8000v` and keeps a stable, separate entity. Entity upsert is driven by
+`troubleshooting.upsert_source: extension:snmp-generic-device|metric:sysuptime`. With no hardware
+identity, every device hashes to the same entity ID.
+
+**Ruled out as sufficient for a unique identity** (all made unique per device, collapse persisted):
+`sysName`, `sysDescr`, `sysObjectID`, `sysContact`, `sysLocation`, `sysUpTime`,
+`ifPhysAddress` (1.3.6.1.2.1.2.2.1.6), `dot1dBaseBridgeAddress` (1.3.6.1.2.1.17.1.1.0),
+`lldpLocChassisId` (1.0.8802.1.1.2.1.3.2.0). None of these populated `chassis_mac`.
+
+**Next candidates (untested — blocked by tooling at end of session):** ENTITY-MIB `entPhysicalTable`
+(`1.3.6.1.2.1.47.1.1.1.1.5`=class 3/chassis, `.11`=serial, `.13`=model) and CDP
+`cdpGlobalDeviceId` (`1.3.6.1.4.1.9.9.23.1.3.4.0`) — CDP is directly implicated because the entity
+exposes a `cdp.device_id` field that is populated for the Cisco and `n/a` for sims.
+
+**Consequence for 50k:** unique *identity* is the gate, not CPU, not SNMP. Until a simulated device can
+present a hardware identity the extension accepts, **N sim devices → 1 entity for any N.** Metrics show
+the same pattern: only the real device produced `device.name`-attributed series (both gauge `if.status`
+and counter `if.bytes_in.count`).
 
 ## 50k build requirements (once the above risk is cleared)
 | Dimension | Finding / requirement |
@@ -48,9 +80,15 @@ infrastructure. **Resolve at 50–100 scale first.**
 | **Materialization latency** | Entity creation observed slow/batchy all session (minutes per handful). At 50k this is a first-order concern; must be characterised. |
 
 ## Recommended path
-1. Fix the 50-device materialization gap (why unique sim devices don't register) at 50–100 scale.
-2. Measure materialization throughput (devices/min to Smartscape) and confirm config device limits.
-3. Only then fan out: `IP_PKTINFO` source fix + variation-module identities + minimal featureSets,
+1. **Solve identity collapse first** (see root cause above) — find the OID(s) that populate
+   `chassis_mac` / `cdp.device_id`. Try ENTITY-MIB `entPhysicalTable` + `cdpGlobalDeviceId` next.
+   Success criterion: 2 sim devices → **2** `EXT_NETWORK_DEVICE` entities. Nothing else matters until
+   this passes — it is a ~7-minute test loop (edit recordings → restart snmpsim → re-count entities).
+   Fastest alternative if OID guessing stalls: read the 3.1.5 extension bundle's `extension.yaml`
+   (download the extension zip from the Hub/API) and look at how the device entity's
+   `id`/`instance` is composed — that names the exact OIDs instead of guessing.
+2. Then measure materialization throughput (devices/min to Smartscape) and confirm config device limits.
+3. Only then fan out: `IP_PKTINFO` source fix + per-device identities + minimal featureSets,
    sized against tenant entity/licensing ceilings.
 
 ## Test-bed artifacts (for cleanup / continuation)

@@ -44,9 +44,21 @@ sim devices (per-device community→recording `w001..w050`, sysName `sim-dev-NNN
 snmpsim bound to `10.20.64.1-50`; config `b7fb4e87`). Findings: polling load negligible (AG loadavg
 ~0.14 / 4 vCPU); recordings MUST include every featureSet OID (missing ifXTable → `INVALID_CONFIG_ERROR
 Text-type oid used as metric value`); **but entity materialization is the blocker — only ~1 of 50 unique
-devices registered as `EXT_NETWORK_DEVICE` over ~20 min** despite config OK. So 50k is gated by
-materialization throughput + tenant entity/licensing limits, NOT polling CPU. Resolve the
-registration/latency behavior at 50–100 scale before any 50k fan-out.
+devices registered as `EXT_NETWORK_DEVICE` over ~20 min** despite config OK.
+
+**ROOT CAUSE DIAGNOSED (2026-11-11): entity identity collapse — not lag, not CPU, not SNMP.**
+Collection is perfect (`Endpoints OK: 50 WARNING: 0 ERROR: 0`), but **all sim devices upsert into ONE
+`EXT_NETWORK_DEVICE`** whose attributes rotate per poll (observed `sim-dev-024` → `sim-device` →
+`sim-dev-048` → `sim-dev-005`, with `snmp.ip`/`sysObjectID` changing to match). The sim node has
+`chassis_mac`/`mac`/`cdp.device_id` = **`n/a`**; the real Cisco has a real MAC + `cdp.device_id` and
+keeps its own stable entity → **identity derives from hardware identity; absent it, everything
+collapses to one entity.** Unique `sysName`/`sysDescr`/`sysObjectID`/`sysContact`/`sysLocation`/
+`sysUpTime`/`ifPhysAddress`/`dot1dBaseBridgeAddress`/`lldpLocChassisId` were ALL made unique and did
+**not** help (none populated `chassis_mac`). Next to try: ENTITY-MIB `entPhysicalTable`
+(`.47.1.1.1.1.5/.11/.13`) and `cdpGlobalDeviceId` (`.1.3.6.1.4.1.9.9.23.1.3.4.0`); or just read the
+3.1.5 extension bundle's `extension.yaml` to see exactly how the device entity ID is composed.
+**Implication: N sim devices → 1 entity for any N until this is solved.** Full detail +
+50k sizing in `docs/50k-topology-sizing.md`.
 
 **Left this session:** test configs `983d744e` + `b7fb4e87` (sim, `ag_group-cloud-snmp`) still exist; snmpsim
 now binds only `10.20.64.1-10` (dropped the `0.0.0.0` wildcard, so other IPs in the /18 no longer
