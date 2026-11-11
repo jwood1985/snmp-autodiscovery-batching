@@ -6,11 +6,19 @@ _Status 2026-11-10. Based on live mid-scale testing on the `qof78400` / Azure te
 Can we make ~50,000 simulated SNMP devices appear as **`EXT_NETWORK_DEVICE`** (+ `EXT_NETWORK_INTERFACE`)
 Smartscape topology via the `snmp-generic-device` monitoring extension?
 
-## Short answer
-**Mechanism: proven. Full scale: feasible but gated by materialization + tenant limits, not by polling.**
-A real device and (transiently) a simulated device both materialized as `EXT_NETWORK_DEVICE`. But at
-**50 unique sim devices**, entity/metric *registration* did not complete reliably in-test (see Risk),
-and that — not CPU — is what must be solved before 50k.
+## Short answer — **NO, not with `snmp-generic-device` 3.1.5 + a routed simulator** (settled 2026-11-11)
+`EXT_NETWORK_DEVICE` identity is **`chassis.mac` alone**, and `chassis.mac` comes from the ActiveGate
+datasource property `this:device.chassis_mac` — **not from any SNMP OID**. Simulated devices reached
+through a routed range have no L2 identity the AG can resolve, so every one of them reports
+`chassis.mac = n/a` → **they all collapse into a single entity, for any N.** 50 devices polled
+perfectly (`Endpoints OK: 50`) and still produced exactly **1** entity whose name/IP rotated per poll.
+
+Eliminated experimentally (each made unique per device, all verified on the wire, collapse persisted):
+`sysName`, `sysDescr`, `sysObjectID`, `sysContact`, `sysLocation`, `sysUpTime`, `ifPhysAddress`
+(both locally-administered `02:…` **and** global-OUI `00:0D:3A:…` forms), `dot1dBaseBridgeAddress`,
+`lldpLocChassisId`, ENTITY-MIB/CDP additions. None populated `chassis_mac`.
+
+**Topology at scale therefore needs real L2 identity**, not a simulator behind a UDR. See "Viable paths".
 
 ## What was proven (mid-scale, 1 AG = D4s_v5 / 4 vCPU)
 1. **`snmp-generic-device` uses the AG's native `snmp` datasource** (`dataSources:["snmp"]`), not pysnmp.
@@ -115,29 +123,27 @@ and counter `if.bytes_in.count`).
 | **Entities & licensing** | 50k devices + interfaces (sim=2/device → ~100k; real devices more) ≈ **150k+ Smartscape entities.** Check tenant entity ceilings and DDU/host-unit licensing on this SE tenant — likely the hard limit. |
 | **Materialization latency** | Entity creation observed slow/batchy all session (minutes per handful). At 50k this is a first-order concern; must be characterised. |
 
-## Recommended path
-1. **Settle `device.chassis_mac` (one test, ~10 min).** `snmpwalk` ifPhysAddress on a sim and compare
-   format with the Cisco. Success criterion for the whole effort: **2 sim devices → 2
-   `EXT_NETWORK_DEVICE` entities.**
-   - If a valid unique `ifPhysAddress` **does** produce distinct `chassis_mac` → simulation is viable;
-     generate per-device MACs and proceed to step 2.
-   - If it does **not** → `chassis.mac` is platform/L2-derived and **simulated devices behind a routed
-     range can never be topologically distinct.** Options then: (a) each sim device on the AG's own L2
-     segment with a unique MAC — in Azure that caps at ~8 NICs/VM, so 50k is impractical; do it on a
-     Linux bridge with 50k macvlan endpoints + the AG on the same bridge (tune
-     `net.ipv4.neigh.default.gc_thresh3`, bridge fdb); (b) use **real** devices for topology and keep
-     the simulator for autodiscovery scale (it already handled 10k sim IPs fine); (c) re-test on a newer
-     extension version — the `TODO: Enable with 1.333 release` comment suggests this handling is in flux.
-2. Then measure materialization throughput (devices/min to Smartscape) and confirm config device limits.
-3. Only then fan out: `IP_PKTINFO` source fix + per-device identities + minimal featureSets,
-   sized against tenant entity/licensing ceilings.
+## Viable paths (given the verdict)
+| Path | Verdict |
+|---|---|
+| **A. Real devices for topology; simulator for autodiscovery scale** | **Recommended.** Autodiscovery (pysnmp, GET-based) already swept 10k sim IPs at ~117 IP/s — use it for batching/throughput work. Use a handful of real NVAs for topology fidelity (proven: C8000V → 1 device + 3 interfaces). |
+| **B. Flat-L2 lab (own hypervisor / Linux bridge)** | Plausible for thousands: one macvlan/veth per simulated device, each with a unique MAC, AG on the same bridge, so the AG can resolve per-device L2 identity. Needs neighbour/fdb tuning (`net.ipv4.neigh.default.gc_thresh3`, bridge fdb limits). **Not achievable in Azure VNet** — SDN caps NICs (~8/VM) and does not present arbitrary per-IP MACs. |
+| **C. Many small Azure VMs** | 1 NIC = 1 MAC = 1 device → 50k VMs. Absurd cost; rejected. |
+| **D. Newer extension version** | Worth re-testing: `extension.yaml` carries `TODO: Enable with 1.333 release` on the `chassis.mac` handling, so the identity source may change (e.g. become OID-based) in a later release — which would make simulation viable. |
+| **E. Synthetic entities via ingest** | Bypass SNMP entirely (MINT/OTLP/Settings topology) — scales to 50k trivially but produces *custom* entities, not `EXT_NETWORK_DEVICE`. |
+
+**Optional confirmation test (settles whether Path B's premise holds in Azure):** add a secondary IP on
+the AG's *own* subnet to the sim VM's NIC (e.g. `10.20.0.50`), bind snmpsim to it, point a 1-device
+config at it. If it gets a real `chassis_mac` (= the sim VM's NIC MAC) and forms its own entity → the
+L2/subnet theory is confirmed. Note it would also show that multiple same-NIC IPs **still** collapse
+(they share one MAC), which is the fundamental reason Azure can't host this at scale.
 
 ## Summary of the three distinct blockers found (in order encountered)
 | # | Blocker | Status |
 |---|---|---|
 | 1 | AG native `ds:snmp` rejects replies whose **source IP ≠ queried IP** (snmpsim on `0.0.0.0` + local route) | **SOLVED** — bind snmpsim to the specific destination IPs |
 | 2 | Recording must cover **every featureSet OID** (missing `ifXTable` → `INVALID_CONFIG_ERROR`) | **SOLVED** — full ifTable + ifXTable; result `Endpoints OK: 50` |
-| 3 | `EXT_NETWORK_DEVICE` ID = **`chassis.mac`**, which is a **DS property, not an OID** → all sims share one identity | **OPEN** — the 50k gate |
+| 3 | `EXT_NETWORK_DEVICE` ID = **`chassis.mac`**, which is a **DS property, not an OID** → all sims share one identity | **CLOSED as not-fixable via simulation** — see verdict; needs real L2 identity |
 
 ## Test-bed artifacts (for cleanup / continuation)
 - snmpsim rebound to `10.20.64.1-50` with per-device recordings `w001..w050.snmprec` (sysName
