@@ -179,3 +179,73 @@ packing (98 configs). Beyond that, add AG groups. **[E]**
 2. **Per-AG device ceiling for generic-device** at 500–1,000 real devices, with real port counts. **[U]**
 3. **WAN-latency effect** on sweep throughput from one real region. **[U]**
 4. **Tenant entity + DDU ceilings** for ~0.5 M entities / ~1 B dp/day. **[U]**
+
+---
+
+## Appendix: ICMP pilot — mechanism discovered, build status (2026-11-11)
+
+### Mechanism (confirmed on tenant qof78400)
+ICMP availability = **"multiprotocol" synthetic monitors**, configured via Settings 2.0 schema
+**`builtin:synthetic.multiprotocol.config`** (siblings: `.name`, `.scheduling`, `.outage-handling`,
+`.performance-thresholds`).
+
+**Hard limits read from the schema** — these set the batching envelope:
+
+| Limit | Value |
+|---|---|
+| `Step.targetList` — targets per request | **10,000** |
+| `properties.steps` — requests per monitor | **100** |
+| → theoretical max per monitor | **1,000,000 targets** |
+| schema `allowedScopes` | `MULTIPROTOCOL_MONITOR` (maxObjects 1 per monitor) |
+
+Because the config is **scoped to an existing monitor entity**, monitors cannot be created through
+Settings 2.0 — the monitor must be created first via the synthetic API, then its config is a settings
+object on that scope.
+
+### Working ICMP step template (lifted from live monitor `MULTIPROTOCOL_MONITOR-486A47D176F7FCF2`)
+```json
+{"requestType":"ICMP","targetList":["10.20.64.1","…"],
+ "properties":[{"key":"EXECUTION_TIMEOUT","value":"PT1S"},
+               {"key":"ICMP_TIME_TO_LIVE","value":"64"},
+               {"key":"ICMP_PACKET_SIZE","value":"32"},
+               {"key":"ICMP_NUMBER_OF_PACKETS","value":"1"},
+               {"key":"ICMP_TIMEOUT_FOR_REPLY","value":"PT1S"},
+               {"key":"ICMP_DO_NOT_FRAGMENT_DATA","value":"true"},
+               {"key":"ICMP_IP_VERSION","value":"4"}],
+ "constraints":[{"type":"SUCCESS_RATE_PERCENT","properties":[{"key":"operator","value":">="},{"key":"value","value":"80"}]}],
+ "requestConfigurations":[{"constraints":[{"type":"ICMP_SUCCESS_RATE_PERCENT","properties":[{"key":"operator","value":">="},{"key":"value","value":"80"}]}],"properties":[]}]}
+```
+
+### Endpoint side: 16,384 ICMP responders already exist, free
+The sim's kernel `local` route makes it answer ICMP for **every** address in `10.20.64.0/18` —
+verified from `vm-ag`: `10.20.64.1`, `10.20.100.7`, `10.20.127.254` all reply. No per-IP config, no
+snmpsim involvement. To reach 50k, two more ranges must be routed to the sim (**+49,152 total**):
+
+| Range | Addresses | Status |
+|---|---|---|
+| `10.20.64.0/18` | 16,384 | ✅ routed + local, answering ICMP |
+| `10.20.128.0/17` | 32,768 | ⬜ needs UDR + local route (was the old "timeout" range) |
+| `10.20.32.0/19` | 8,192 | ⬜ needs UDR + local route (headroom to clear 50,000) |
+
+### Generator
+`provisioning/gen-icmp-synthetics.py` — emits the monitor payloads, a flat `targets.txt` for `fping`
+verification, and a MANIFEST. Verified producing **500 monitors × 100 targets = 50,000**.
+Two layouts: `--mode targets-per-step` (1 request × 100 targets, default) and `--mode step-per-target`
+(100 requests × 1 target — the literal "100 requests" reading; capped at 100 by the steps limit).
+
+### ⚠️ Ramp, don't jump to 500
+500 monitor executions/minute on one synthetic AG is the thing under test. 50,000 pings/min is only
+~833 pps (network-trivial), so the limit will be **execution slots/scheduling**, not packets.
+Run **50 → 150 → 500 monitors**, recording at each stage: AG CPU/loadavg, execution duration vs
+frequency, skipped/overdue executions, and entity+DDU growth. Jumping straight to 500 gives an
+ambiguous failure.
+
+### Blocked on (all external to the generator)
+1. **Synthetic-enabled private AG + private location ID** — being built.
+2. **Token scope** — monitor *creation* needs `environment-api:synthetic-monitors:read` + `:write`.
+   The existing `dt0s16…` platform token returns
+   `403 OAuth token is missing required scope. Use one of: [environment-api:synthetic-monitors:read]`.
+   (`/api/v1/synthetic/locations` additionally rejects `Bearer` — wants a classic `Api-Token`.)
+   Note the v1/v2 synthetic API lives on the **live** domain (`qof78400.live.dynatrace.com`),
+   not `.apps.`.
+3. **UDR routes** for the two extra ranges (Network RP unreachable from the self-hosted session).
