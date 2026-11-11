@@ -54,11 +54,18 @@ Collection is perfect (`Endpoints OK: 50 WARNING: 0 ERROR: 0`), but **all sim de
 keeps its own stable entity → **identity derives from hardware identity; absent it, everything
 collapses to one entity.** Unique `sysName`/`sysDescr`/`sysObjectID`/`sysContact`/`sysLocation`/
 `sysUpTime`/`ifPhysAddress`/`dot1dBaseBridgeAddress`/`lldpLocChassisId` were ALL made unique and did
-**not** help (none populated `chassis_mac`). Next to try: ENTITY-MIB `entPhysicalTable`
-(`.47.1.1.1.1.5/.11/.13`) and `cdpGlobalDeviceId` (`.1.3.6.1.4.1.9.9.23.1.3.4.0`); or just read the
-3.1.5 extension bundle's `extension.yaml` to see exactly how the device entity ID is composed.
-**Implication: N sim devices → 1 entity for any N until this is solved.** Full detail +
-50k sizing in `docs/50k-topology-sizing.md`.
+**not** help. **CONFIRMED from the 3.1.5 extension bundle** (downloadable via
+`GET /platform/extensions/v2/extensions/<ext>/3.1.5` with `Accept: application/octet-stream`):
+`openpipeline/metrics.pipeline.json` defines `EXT_NETWORK_DEVICE` with
+`idComponents: [{identifier, referencedFieldName: chassis.mac}]` — **the entity ID is `chassis.mac`
+alone** (name comes from `sys.name`, hence the rotating name). And `extension.yaml:359` sets
+`chassis.mac: this:device.chassis_mac` — **a datasource-provided property, NOT an OID** (with a
+`TODO: Enable with 1.333 release` note) → **no `.snmprec` content can ever set it.** Interfaces are
+keyed `network_interface_{mac.address}_{if.name}` with `mac.address` filtered to exclude `n/a`, so they
+need real MACs too. **Implication: N sim devices → 1 entity for any N.** Open sub-question: how the DS
+computes `device.chassis_mac` (the Cisco's value is its real NIC MAC, and the AG's ARP shows only the
+Azure fabric MAC, so it is likely `ifPhysAddress`-derived) — settle with one `snmpwalk
+1.3.6.1.2.1.2.2.1.6` comparison. Full detail + 50k sizing in `docs/50k-topology-sizing.md`.
 
 **Left this session:** test configs `983d744e` + `b7fb4e87` (sim, `ag_group-cloud-snmp`) still exist; snmpsim
 now binds only `10.20.64.1-10` (dropped the `0.0.0.0` wildcard, so other IPs in the /18 no longer
